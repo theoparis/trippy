@@ -1,0 +1,13 @@
+# Distribution
+dist
+out
+build
+node_modules
+target
+coverage
+*.log*
+*.env*
+*.DS_Store*
+!*.example*
+.vscode
+.idea

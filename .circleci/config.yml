@@ -1,0 +1,9 @@
+version: 2.1
+jobs:
+  lint:
+    docker:
+      - image: instrumentisto/rust:nightly-alpine
+    steps:
+      - checkout
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy -- -Dwarnings
