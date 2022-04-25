@@ -11,9 +11,11 @@ pub enum Instruction {
 }
 
 pub fn str_literal() -> impl Parser<char, Instruction, Error = Simple<char>> {
-    just('"')
-        .ignore_then(filter(|c| *c != '"').repeated())
-        .then_ignore(just('"'))
+    let quote = choice((just('"'), just('\'')));
+
+    quote
+        .ignore_then(filter(|c| *c != '"' && *c != '\'').repeated())
+        .then_ignore(quote)
         .collect::<String>()
         .map(Instruction::StringLiteral)
 }
@@ -32,11 +34,14 @@ pub fn fn_call() -> impl Parser<char, Instruction, Error = Simple<char>> {
         text::ident()
             .separated_by(just('.'))
             .map(|v| v.join("."))
+            .padded()
             .then_ignore(just('('))
+            .padded()
             .then(
                 choice((str_literal(), num_literal(), fn_call_parser))
                     .separated_by(just(',')),
             )
+            .padded()
             .then_ignore(just(')'))
             .map(|(ident, args)| Instruction::FunctionCall {
                 name: ident,
@@ -49,6 +54,7 @@ pub fn parser() -> impl Parser<char, Vec<Instruction>, Error = Simple<char>> {
     recursive(|_parser| {
         choice((str_literal(), num_literal(), fn_call()))
             .then_ignore(just(';').or_not())
+            .padded()
             .repeated()
     })
     .then_ignore(end())
