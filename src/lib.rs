@@ -14,6 +14,38 @@ pub enum Instruction {
 	Object(BTreeMap<String, Instruction>),
 }
 
+impl std::fmt::Display for Instruction {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Instruction::StringLiteral(value) => {
+				write!(f, "{}", value)?;
+			}
+			Instruction::NumericLiteral(value) => {
+				write!(f, "{}", value)?;
+			}
+			Instruction::FunctionCall { name, args } => {
+				write!(f, "{}(", name)?;
+
+				for arg in args {
+					write!(f, "{}", arg)?;
+				}
+
+				write!(f, ")")?;
+			}
+			Instruction::Array(values) => {
+				for value in values {
+					write!(f, "{}", value)?;
+				}
+			}
+			Instruction::Object(map) => {
+				unimplemented!()
+			}
+		}
+
+		Ok(())
+	}
+}
+
 pub fn value() -> impl Parser<char, Instruction, Error = Simple<char>> {
 	recursive(|value| {
 		let quote = choice((just('"'), just('\'')));

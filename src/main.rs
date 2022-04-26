@@ -1,6 +1,7 @@
 use ariadne::{Color, Fmt, Label, Report, ReportKind, Source};
 use chumsky::Parser;
-use trippy::parser;
+use std::{collections::BTreeMap, io::BufRead};
+use trippy::{parser, Instruction};
 
 fn main() {
 	let src = std::fs::read_to_string(
@@ -77,5 +78,53 @@ fn main() {
 		report.finish().print(Source::from(&src)).unwrap();
 	});
 
-	println!("{:#?}", ast);
+	if ast.is_none() {
+		std::process::exit(1);
+	}
+
+	let mut variables: BTreeMap<String, Instruction> = Default::default();
+	let mut functions: BTreeMap<
+		String,
+		Box<dyn Fn(Vec<Instruction>) -> Vec<Instruction>>,
+	> = Default::default();
+
+	functions.insert(
+		"console.log".to_string(),
+		Box::new(|args| {
+			println!("{}", args[0]);
+
+			vec![]
+		}),
+	);
+
+	let ast = ast.unwrap();
+	let mut i = 0;
+
+	loop {
+		let mut line = String::new();
+		let stdin = std::io::stdin();
+		stdin.lock().read_line(&mut line).unwrap();
+
+		if i >= ast.len() {
+			break;
+		}
+
+		let value = ast.get(i);
+		i += 1;
+
+		if let Some(value) = value {
+			match value {
+				Instruction::FunctionCall { name, args } => {
+					let function = functions.get(name);
+
+					if let Some(function) = function {
+						function(args.to_vec());
+					} else {
+						println!("Unknown function: {}", name);
+					}
+				}
+				_ => {}
+			}
+		}
+	}
 }
