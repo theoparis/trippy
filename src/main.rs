@@ -3,12 +3,7 @@ use chumsky::Parser;
 use std::{collections::BTreeMap, io::BufRead};
 use trippy::{parser, Instruction};
 
-fn main() {
-	let src = std::fs::read_to_string(
-		std::env::args().nth(1).expect("Expected file argument"),
-	)
-	.expect("Failed to read file");
-
+fn parse(src: &str) -> Vec<Instruction> {
 	let (ast, errs) = parser().parse_recovery(src.trim());
 	errs.into_iter().for_each(|e| {
 		let msg = if let chumsky::error::SimpleReason::Custom(msg) = e.reason()
@@ -82,22 +77,21 @@ fn main() {
 		std::process::exit(1);
 	}
 
+	ast.unwrap()
+}
+
+fn main() {
+	let src = std::fs::read_to_string(
+		std::env::args().nth(1).expect("Expected file argument"),
+	)
+	.expect("Failed to read file");
+
+	let ast = parse(&src);
+
 	let mut variables: BTreeMap<String, Instruction> = Default::default();
-	let mut functions: BTreeMap<
-		String,
-		Box<dyn Fn(Vec<Instruction>) -> Vec<Instruction>>,
-	> = Default::default();
 
-	functions.insert(
-		"console.log".to_string(),
-		Box::new(|args| {
-			println!("{}", args[0]);
+	dbg!(ast.clone());
 
-			vec![]
-		}),
-	);
-
-	let ast = ast.unwrap();
 	let mut i = 0;
 
 	loop {
@@ -115,16 +109,63 @@ fn main() {
 		if let Some(value) = value {
 			match value {
 				Instruction::FunctionCall { name, args } => {
-					let function = functions.get(name);
+					match name.as_str() {
+						"console.log" => {
+							for arg in args {
+								match arg {
+									Instruction::VariableReference(
+										variable_reference,
+									) => {
+										let variable =
+											variables.get(variable_reference);
 
-					if let Some(function) = function {
-						function(args.to_vec());
-					} else {
-						println!("Unknown function: {}", name);
+										if let Some(variable) = variable {
+											println!("{}", variable);
+										} else {
+											eprintln!(
+												"Variable does not exist: {}",
+												variable_reference
+											);
+										}
+									}
+									_ => println!("{}", arg),
+								}
+							}
+						}
+						_ => eprintln!("Unknown function: {}", name),
 					}
+				}
+				// TODO: implement scopes and function definitions
+				Instruction::Variable { name, value, .. } => {
+					variables.insert(name.to_string(), *value.to_owned());
 				}
 				_ => {}
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use trippy::Instruction;
+
+	use crate::parse;
+
+	#[test]
+	fn test_variables() {
+		let source = r#"
+		let x = 123.456;
+		"#;
+
+		let ast = parse(source);
+
+		assert_eq!(
+			ast[0],
+			Instruction::Variable {
+				scope: trippy::VariableScope::Let,
+				name: "x".to_string(),
+				value: Box::new(Instruction::NumericLiteral(123.456))
+			}
+		);
 	}
 }

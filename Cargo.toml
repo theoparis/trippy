@@ -4,5 +4,5 @@ version = "0.0.1"
 edition = "2021"
 
 [dependencies]
-chumsky = "0.8.0"
+chumsky = { git = "https://github.com/zesterer/chumsky" } 
 ariadne = "0.1.5"

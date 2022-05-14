@@ -3,6 +3,12 @@ use std::collections::BTreeMap;
 use chumsky::prelude::*;
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum VariableScope {
+	Let,
+	Const,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Instruction {
 	StringLiteral(String),
 	NumericLiteral(f32),
@@ -12,6 +18,12 @@ pub enum Instruction {
 	},
 	Array(Vec<Instruction>),
 	Object(BTreeMap<String, Instruction>),
+	Variable {
+		scope: VariableScope,
+		name: String,
+		value: Box<Instruction>,
+	},
+	VariableReference(String),
 }
 
 impl std::fmt::Display for Instruction {
@@ -37,9 +49,11 @@ impl std::fmt::Display for Instruction {
 					write!(f, "{}", value)?;
 				}
 			}
-			Instruction::Object(map) => {
+			Instruction::VariableReference(_name) => unimplemented!(),
+			Instruction::Object(_map) => {
 				unimplemented!()
 			}
+			Instruction::Variable { .. } => unimplemented!(),
 		}
 
 		Ok(())
@@ -122,16 +136,44 @@ pub fn value() -> impl Parser<char, Instruction, Error = Simple<char>> {
 			.padded()
 			.then_ignore(just('('))
 			.padded()
-			.then(value.separated_by(just(',')))
+			.then(value.clone().separated_by(just(',')))
 			.padded()
 			.then_ignore(just(')'))
-			.labelled("fn_call")
+			.labelled("function_call")
 			.map(|(ident, args)| Instruction::FunctionCall {
 				name: ident,
 				args,
 			});
 
-		choice((string_literal, num_literal, fn_call, object))
+		let variable = choice((just("let"), just("const")))
+			.padded()
+			.then(text::ident().labelled("variable_name").padded())
+			.then_ignore(just('=').padded())
+			.then(value.padded())
+			.labelled("variable")
+			.map(|((scope, name), value)| Instruction::Variable {
+				scope: match scope {
+					"let" => VariableScope::Let,
+					"const" => VariableScope::Const,
+					_ => panic!("Invalid variable scope: {}", scope),
+				},
+				name,
+				value: Box::new(value),
+			});
+
+		let variable_reference = text::ident()
+			.padded()
+			.labelled("variable_reference")
+			.map(Instruction::VariableReference);
+
+		choice((
+			string_literal,
+			num_literal,
+			fn_call,
+			object,
+			variable,
+			variable_reference,
+		))
 	})
 }
 
