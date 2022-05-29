@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use chumsky::prelude::*;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VariableScope {
 	Let,
 	Const,
@@ -11,7 +11,7 @@ pub enum VariableScope {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instruction {
 	StringLiteral(String),
-	NumericLiteral(f32),
+	NumericLiteral(f64),
 	FunctionCall {
 		name: String,
 		args: Vec<Instruction>,
@@ -73,7 +73,7 @@ pub fn value() -> impl Parser<char, Instruction, Error = Simple<char>> {
 				.or(just('r').to('\r'))
 				.or(just('t').to('\t'))
 				.or(just('u').ignore_then(
-					filter(|c: &char| c.is_digit(16))
+					filter(|c: &char| c.is_ascii_hexdigit())
 						.repeated()
 						.exactly(4)
 						.collect::<String>()

@@ -1,8 +1,2 @@
-[package]
-name = "trippy"
-version = "0.0.1"
-edition = "2021"
-
-[dependencies]
-chumsky = { git = "https://github.com/zesterer/chumsky" } 
-ariadne = "0.1.5"
+[workspace]
+members = ["compiler", "parser"]
