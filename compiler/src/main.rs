@@ -5,12 +5,47 @@ use inkwell::{
 	context::Context as InkContext,
 	execution_engine::JitFunction,
 	module::Linkage,
-	types::{BasicMetadataTypeEnum, BasicTypeEnum},
+	types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum},
 	values::{BasicMetadataValueEnum, CallableValue, PointerValue},
 	AddressSpace, OptimizationLevel,
 };
 use std::collections::BTreeMap;
 use trippy::{parser, Instruction};
+
+#[allow(clippy::needless_lifetimes)]
+pub fn create_llvm_type<'a>(
+	ctx: &'a InkContext,
+	type_name: &str,
+) -> BasicTypeEnum<'a> {
+	let i32_type = ctx.i32_type();
+	let bool_type = ctx.bool_type();
+	let f64_type = ctx.f64_type();
+	let i8_type = ctx.i8_type();
+	let str_type = ctx.i8_type().ptr_type(AddressSpace::Generic);
+
+	match type_name {
+		"i8" => i8_type.into(),
+		"i32" => i32_type.into(),
+		"f64" => f64_type.into(),
+		"string" => str_type.into(),
+		"boolean" => bool_type.into(),
+		_ => unimplemented!(),
+	}
+}
+
+#[allow(clippy::needless_lifetimes)]
+pub fn create_llvm_arg_types<'a>(
+	ctx: &'a InkContext,
+	args: impl Iterator<Item = Instruction>,
+) -> Vec<BasicMetadataTypeEnum<'a>> {
+	args.map(|arg| match arg {
+		Instruction::StringLiteral(type_name) => {
+			create_llvm_type(ctx, &type_name).into()
+		}
+		_ => unimplemented!(),
+	})
+	.collect()
+}
 
 pub fn create_llvm_args<'a>(
 	builder: &Builder<'a>,
@@ -66,9 +101,7 @@ pub fn build(ast: Vec<Instruction>, module_name: &str) {
 	let builder = ctx.create_builder();
 
 	let i32_type = ctx.i32_type();
-	//let i8_type = ctx.i8_type();
 	let f64_type = ctx.f64_type();
-	//let void_type = ctx.void_type();
 	let str_type = ctx.i8_type().ptr_type(AddressSpace::Generic);
 
 	let main_fn_type = i32_type.fn_type(&[], false);
@@ -100,13 +133,20 @@ pub fn build(ast: Vec<Instruction>, module_name: &str) {
 								Instruction::StringLiteral(return_type) => {
 									match &args[0] {
 										Instruction::StringLiteral(_) => {
-											let fun_type =
-												match return_type.as_str() {
-													// TODO: resolve argument types
-													"i32" => i32_type
-														.fn_type(&[BasicMetadataTypeEnum::PointerType(str_type)], true),
-													_ => unimplemented!(),
-												};
+											let return_type = create_llvm_type(
+												&ctx,
+												return_type,
+											);
+											let fun_type = return_type.fn_type(
+												create_llvm_arg_types(
+													&ctx,
+													args.clone()
+														.into_iter()
+														.skip(2),
+												)
+												.as_slice(),
+												true,
+											);
 
 											BasicTypeEnum::PointerType(
 												fun_type.ptr_type(
@@ -155,12 +195,20 @@ pub fn build(ast: Vec<Instruction>, module_name: &str) {
 										Instruction::StringLiteral(
 											return_type,
 										) => {
-											let fun_type =
-												match return_type.as_str() {
-													"i32" => i32_type
-														.fn_type(&[BasicMetadataTypeEnum::PointerType(str_type)], false),
-													_ => unimplemented!(),
-												};
+											let return_type = create_llvm_type(
+												&ctx,
+												return_type,
+											);
+											let fun_type = return_type.fn_type(
+												create_llvm_arg_types(
+													&ctx,
+													args.clone()
+														.into_iter()
+														.skip(2),
+												)
+												.as_slice(),
+												true,
+											);
 
 											let fun = module.add_function(
 												fun_name,
