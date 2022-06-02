@@ -92,13 +92,10 @@ pub fn value() -> impl Parser<char, Instruction, Error = Simple<char>> {
 				)),
 		);
 
-		let string = quote
-			.ignore_then(
-				filter(|c| *c != '\\' && *c != '"' && *c != '\'')
-					.or(escape)
-					.repeated(),
-			)
-			.then_ignore(quote)
+		let string = filter(|c| *c != '\\' && *c != '"' && *c != '\'')
+			.or(escape)
+			.repeated()
+			.delimited_by(quote, quote)
 			.collect::<String>();
 
 		let string_literal = string
@@ -130,16 +127,26 @@ pub fn value() -> impl Parser<char, Instruction, Error = Simple<char>> {
 			.collect::<BTreeMap<String, Instruction>>()
 			.map(Instruction::Object)
 			.labelled("object");
+
+		//let args = text::ident()
+		//.separated_by(just(','))
+		//.allow_trailing()
+		//.delimited_by(just('('), just(')'))
+		//.labelled("function args");
+
 		let fn_call = text::ident()
 			.separated_by(just('.'))
+			.padded()
 			.map(|v| v.join("."))
-			.padded()
-			.then_ignore(just('('))
-			.padded()
-			.then(value.clone().separated_by(just(',')))
-			.padded()
-			.then_ignore(just(')'))
-			.labelled("function_call")
+			.then(
+				value
+					.clone()
+					.padded()
+					.separated_by(just(','))
+					.allow_trailing()
+					.delimited_by(just('('), just(')')),
+			)
+			.labelled("function call")
 			.map(|(ident, args)| Instruction::FunctionCall {
 				name: ident,
 				args,

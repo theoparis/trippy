@@ -1,15 +1,63 @@
 use ariadne::{Color, Fmt, Label, Report, ReportKind, Source};
 use chumsky::Parser;
 use inkwell::{
+	builder::Builder,
 	context::Context as InkContext,
 	execution_engine::JitFunction,
 	module::Linkage,
 	types::{BasicMetadataTypeEnum, BasicTypeEnum},
-	values::BasicMetadataValueEnum,
+	values::{BasicMetadataValueEnum, CallableValue, PointerValue},
 	AddressSpace, OptimizationLevel,
 };
-use std::{collections::BTreeMap, io::BufRead};
+use std::collections::BTreeMap;
 use trippy::{parser, Instruction};
+
+pub fn create_llvm_args<'a>(
+	builder: &Builder<'a>,
+	variables: &BTreeMap<String, PointerValue<'a>>,
+	args: Vec<Instruction>,
+) -> Vec<BasicMetadataValueEnum<'a>> {
+	let mut llvm_args = vec![];
+
+	for arg in args {
+		match arg {
+			Instruction::StringLiteral(value) => {
+				llvm_args.push(BasicMetadataValueEnum::PointerValue(
+					builder
+						.build_global_string_ptr(value.as_str(), "temp")
+						.as_pointer_value(),
+				));
+			}
+			Instruction::VariableReference(name) => {
+				let variable = variables.get(&name);
+
+				if variable.is_none() {
+					panic!("Unknown variable {}", name);
+				}
+
+				let var_arg = builder.build_load(*variable.unwrap(), &name);
+
+				if var_arg.is_pointer_value() {
+					llvm_args.push(BasicMetadataValueEnum::PointerValue(
+						var_arg.into_pointer_value(),
+					));
+				} else if var_arg.is_float_value() {
+					llvm_args.push(BasicMetadataValueEnum::FloatValue(
+						var_arg.into_float_value(),
+					));
+				} else if var_arg.is_int_value() {
+					llvm_args.push(BasicMetadataValueEnum::IntValue(
+						var_arg.into_int_value(),
+					));
+				} else {
+				}
+			}
+			_ => unimplemented!(),
+		}
+	}
+
+	llvm_args
+}
 
 pub fn build(ast: Vec<Instruction>, module_name: &str) {
 	let ctx = InkContext::create();
@@ -22,11 +70,6 @@ pub fn build(ast: Vec<Instruction>, module_name: &str) {
 	let f64_type = ctx.f64_type();
 	//let void_type = ctx.void_type();
 	let str_type = ctx.i8_type().ptr_type(AddressSpace::Generic);
-
-	let print_fn_type =
-		i32_type.fn_type(&[BasicMetadataTypeEnum::PointerType(str_type)], true);
-	let print_fn =
-		module.add_function("printf", print_fn_type, Some(Linkage::External));
 
 	let main_fn_type = i32_type.fn_type(&[], false);
 	let main_fn = module.add_function("main", main_fn_type, None);
@@ -43,17 +86,46 @@ pub fn build(ast: Vec<Instruction>, module_name: &str) {
 				name,
 				value,
 			} => {
-				let variable_type = match *value {
+				let value = *value;
+				let variable_type = match value.clone() {
 					Instruction::StringLiteral(_) => {
 						BasicTypeEnum::PointerType(str_type)
 					}
 					Instruction::NumericLiteral(_) => {
 						BasicTypeEnum::FloatType(f64_type)
 					}
+					Instruction::FunctionCall { name, args } => {
+						match name.as_str() {
+							"loadExternalFunction" => match &args[1] {
+								Instruction::StringLiteral(return_type) => {
+									match &args[0] {
+										Instruction::StringLiteral(_) => {
+											let fun_type =
+												match return_type.as_str() {
+													// TODO: resolve argument types
+													"i32" => i32_type
+														.fn_type(&[BasicMetadataTypeEnum::PointerType(str_type)], true),
+													_ => unimplemented!(),
+												};
+
+											BasicTypeEnum::PointerType(
+												fun_type.ptr_type(
+													AddressSpace::Generic,
+												),
+											)
+										}
+										_ => unimplemented!(),
+									}
+								}
+								_ => unimplemented!(),
+							},
+							_ => unimplemented!(),
+						}
+					}
 					_ => unimplemented!(),
 				};
 
-				let alloca = {
+				let mut alloca = {
 					match entry_basic_block.get_first_instruction() {
 						Some(first_instr) => {
 							builder.position_before(&first_instr)
@@ -64,7 +136,7 @@ pub fn build(ast: Vec<Instruction>, module_name: &str) {
 					builder.build_alloca(variable_type, &name)
 				};
 
-				match *value {
+				match value {
 					Instruction::StringLiteral(value) => {
 						builder.build_store(
 							alloca,
@@ -75,70 +147,66 @@ pub fn build(ast: Vec<Instruction>, module_name: &str) {
 						builder
 							.build_store(alloca, f64_type.const_float(value));
 					}
-					_ => unimplemented!(),
-				}
+					Instruction::FunctionCall { name, args } => {
+						match name.as_str() {
+							"loadExternalFunction" => match &args[0] {
+								Instruction::StringLiteral(fun_name) => {
+									match &args[1] {
+										Instruction::StringLiteral(
+											return_type,
+										) => {
+											let fun_type =
+												match return_type.as_str() {
+													"i32" => i32_type
+														.fn_type(&[BasicMetadataTypeEnum::PointerType(str_type)], false),
+													_ => unimplemented!(),
+												};
 
-				variables.insert(name.clone(), alloca);
-			}
-			Instruction::FunctionCall { name, args } => {
-				match name.as_str() {
-					"console.log" => {
-						let mut llvm_args = vec![];
+											let fun = module.add_function(
+												fun_name,
+												fun_type,
+												Some(Linkage::External),
+											);
 
-						for arg in args {
-							match arg {
-								Instruction::StringLiteral(value) => {
-									llvm_args.push(
-										BasicMetadataValueEnum::PointerValue(
+											let fun_ptr = fun
+												.as_global_value()
+												.as_pointer_value();
+
+											alloca = builder.build_alloca(
+												fun_ptr.get_type(),
+												&format!("alloca_{}", fun_name),
+											);
 											builder
-												.build_global_string_ptr(
-													value.as_str(),
-													"temp",
-												)
-												.as_pointer_value(),
-										),
-									);
-								}
-								Instruction::VariableReference(name) => {
-									let variable = variables.get(&name);
-
-									if variable.is_none() {
-										panic!("Unknown variable {}", name);
-									}
-
-									let var_arg = builder
-										.build_load(*variable.unwrap(), &name);
-
-									if var_arg.is_pointer_value() {
-										llvm_args.push(BasicMetadataValueEnum::PointerValue(
-											var_arg.into_pointer_value(),
-										));
-									} else if var_arg.is_float_value() {
-										llvm_args.push(
-											BasicMetadataValueEnum::FloatValue(
-												var_arg.into_float_value(),
-											),
-										);
-									} else if var_arg.is_int_value() {
-										llvm_args.push(
-											BasicMetadataValueEnum::IntValue(
-												var_arg.into_int_value(),
-											),
-										);
-									} else {
+												.build_store(alloca, fun_ptr);
+										}
+										_ => unimplemented!(),
 									}
 								}
 								_ => unimplemented!(),
-							}
+							},
+							_ => unimplemented!(),
 						}
-
-						builder.build_call(
-							print_fn,
-							llvm_args.as_slice(),
-							"printf",
-						);
 					}
 					_ => unimplemented!(),
+				}
+
+				variables.insert(name, alloca);
+			}
+			Instruction::FunctionCall { name, args } => {
+				let variable = variables.get(&name);
+
+				if let Some(variable) = variable {
+					let function = builder.build_load(*variable, "load");
+					let function = function.into_pointer_value();
+					let args = create_llvm_args(&builder, &variables, args);
+
+					builder.build_call(
+						CallableValue::try_from(function).unwrap(),
+						&args,
+						&name,
+					);
+				} else {
+					panic!("Invalid function {}", name);
 				}
 			}
 			_ => unimplemented!(),
@@ -151,6 +219,11 @@ pub fn build(ast: Vec<Instruction>, module_name: &str) {
 	//"Generated LLVM IR: {}",
 	//main_fn.print_to_string().to_string()
 	//);
+
+	if let Err(err) = module.verify() {
+		eprintln!("{}", err);
+		std::process::exit(1);
+	}
 
 	let execution_engine = module
 		.create_jit_execution_engine(OptimizationLevel::Default)
@@ -242,68 +315,15 @@ fn parse(src: &str) -> Vec<Instruction> {
 }
 
 fn main() {
-	let src = std::fs::read_to_string(
-		std::env::args().nth(1).expect("Expected file argument"),
-	)
-	.expect("Failed to read file");
+	let src_name = std::env::args().nth(1).expect("Expected file argument");
+	let src =
+		std::fs::read_to_string(src_name.clone()).expect("Failed to read file");
 
 	let ast = parse(&src);
 
-	let mut variables: BTreeMap<String, Instruction> = Default::default();
-
 	//dbg!(ast.clone());
 
-	let mut i = 0;
-
-	loop {
-		let mut line = String::new();
-		let stdin = std::io::stdin();
-		stdin.lock().read_line(&mut line).unwrap();
-
-		if i >= ast.len() {
-			break;
-		}
-
-		let value = ast.get(i);
-		i += 1;
-
-		if let Some(value) = value {
-			match value {
-				Instruction::FunctionCall { name, args } => {
-					match name.as_str() {
-						"console.log" => {
-							for arg in args {
-								match arg {
-									Instruction::VariableReference(
-										variable_reference,
-									) => {
-										let variable =
-											variables.get(variable_reference);
-
-										if let Some(variable) = variable {
-											println!("{}", variable);
-										} else {
-											eprintln!(
-												"Variable does not exist: {}",
-												variable_reference
-											);
-										}
-									}
-									_ => println!("{}", arg),
-								}
-							}
-						}
-						_ => eprintln!("Unknown function: {}", name),
-					}
-				}
-				// TODO: implement scopes and function definitions
-				Instruction::Variable { name, value, .. } => {
-					variables.insert(name.to_string(), *value.to_owned());
-				}
-				_ => {}
-			}
-		}
-	}
+	build(ast, &src_name);
 }
 
 #[cfg(test)]
