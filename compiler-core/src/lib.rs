@@ -3,7 +3,7 @@ use chumsky::Parser;
 use inkwell::{
 	builder::Builder,
 	context::Context as InkContext,
-	module::Linkage,
+	module::{Linkage, Module},
 	targets::{
 		CodeModel, FileType, InitializationConfig, RelocMode, Target,
 		TargetMachine,
@@ -112,8 +112,11 @@ pub fn create_llvm_args<'a>(
 	llvm_args
 }
 
-pub fn build(ast: Vec<Instruction>, module_name: &str) -> Result<Vec<u8>> {
-	let ctx = InkContext::create();
+pub fn build<'a>(
+	ctx: &'a InkContext,
+	ast: Vec<Instruction>,
+	module_name: &str,
+) -> Result<Module<'a>> {
 	let module = ctx.create_module(module_name);
 
 	let builder = ctx.create_builder();
@@ -152,12 +155,12 @@ pub fn build(ast: Vec<Instruction>, module_name: &str) -> Result<Vec<u8>> {
 									match &args[0] {
 										Instruction::StringLiteral(_) => {
 											let return_type = create_llvm_type(
-												&ctx,
+												ctx,
 												return_type,
 											);
 											let fun_type = return_type.fn_type(
 												create_llvm_arg_types(
-													&ctx,
+													ctx,
 													args.clone()
 														.into_iter()
 														.skip(2),
@@ -214,12 +217,12 @@ pub fn build(ast: Vec<Instruction>, module_name: &str) -> Result<Vec<u8>> {
 											return_type,
 										) => {
 											let return_type = create_llvm_type(
-												&ctx,
+												ctx,
 												return_type,
 											);
 											let fun_type = return_type.fn_type(
 												create_llvm_arg_types(
-													&ctx,
+													ctx,
 													args.clone()
 														.into_iter()
 														.skip(2),
@@ -290,6 +293,10 @@ pub fn build(ast: Vec<Instruction>, module_name: &str) -> Result<Vec<u8>> {
 		.verify()
 		.map_err(|s| TrippyError::ModuleVerification(s.to_string()))?;
 
+	Ok(module)
+}
+
+pub fn compile(module: &'_ Module) -> Result<Vec<u8>> {
 	Target::initialize_native(&InitializationConfig::default())
 		.map_err(TrippyError::NativeTargetInitialization)?;
 
@@ -312,10 +319,25 @@ pub fn build(ast: Vec<Instruction>, module_name: &str) -> Result<Vec<u8>> {
 	// create a module and do JIT stuff
 
 	let buffer = machine
-		.write_to_memory_buffer(&module, FileType::Object)
+		.write_to_memory_buffer(module, FileType::Object)
 		.unwrap();
 
 	Ok(buffer.as_slice().to_vec())
+}
+
+pub fn interpret(module: &'_ Module) -> Result<i32> {
+	use inkwell::execution_engine::JitFunction;
+
+	let execution_engine = module
+		.create_jit_execution_engine(OptimizationLevel::Default)
+		.unwrap();
+
+	unsafe {
+		let jit_function: JitFunction<unsafe extern "C" fn() -> i32> =
+			execution_engine.get_function("main").unwrap();
+
+		Ok(jit_function.call())
+	}
 }
 
 pub fn parse(src: &str) -> Vec<Instruction> {
