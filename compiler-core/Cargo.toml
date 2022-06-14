@@ -1,0 +1,13 @@
+[package]
+name = "trippy-compiler-core"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+ariadne = "0.1.5"
+chumsky = { git = "https://github.com/zesterer/chumsky" } 
+trippy = { path = "../parser" }
+inkwell = { git = "https://github.com/TheDan64/inkwell", branch = "master", features = ["llvm13-0"] }
+miette = "4.7.1"
+thiserror = "1.0.31"

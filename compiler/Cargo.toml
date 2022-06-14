@@ -1,0 +1,11 @@
+[package]
+name = "trippy-compiler"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+trippy-compiler-core = { path = "../compiler-core" }
+miette = { version = "4.7.1", features = ["fancy"] }
+bpaf = "0.4.4"
+inkwell = { git = "https://github.com/TheDan64/inkwell", branch = "master", features = ["llvm13-0"] }
