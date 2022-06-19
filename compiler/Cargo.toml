@@ -9,3 +9,5 @@ trippy-compiler-core = { path = "../compiler-core" }
 miette = { version = "4.7.1", features = ["fancy"] }
 bpaf = "0.4.4"
 cranelift = "0.84.0"
+cranelift-jit = "0.84.0"
+cranelift-object = "0.84.0"

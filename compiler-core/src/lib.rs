@@ -2,7 +2,8 @@ use ariadne::{Color, Fmt, Label, Report, ReportKind, Source};
 use chumsky::Parser;
 use cranelift::{codegen::ir::Function, prelude::*};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{DataContext, Linkage, Module, ModuleError};
+use cranelift_module::{DataContext, FuncId, Linkage, Module, ModuleError};
+use cranelift_object::{ObjectBuilder, ObjectModule};
 use miette::{Diagnostic, Result};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -30,29 +31,70 @@ pub fn initialize<'a>(
 	FunctionBuilder::new(func, builder_context)
 }
 
-pub struct JIT {
+#[allow(clippy::large_enum_variant)]
+pub enum CompilerModule {
+	Jit(JITModule),
+	Object(ObjectModule),
+}
+
+impl CompilerModule {
+	pub fn into_generic(&mut self) -> Box<&mut dyn Module> {
+		match self {
+			CompilerModule::Jit(jit) => Box::new(jit),
+			CompilerModule::Object(obj) => Box::new(obj),
+		}
+	}
+}
+
+pub struct Compiler {
 	/// The data context, which is to data objects what `ctx` is to functions.
 	pub data_ctx: DataContext,
 
-	/// The module, with the jit backend, which manages the JIT'd
+	/// The module, with the jit backend, which manages the Compiler'd
 	/// functions.
-	pub module: JITModule,
+	pub module: CompilerModule,
 	pub variables: BTreeMap<String, Variable>,
 	pub objects: BTreeMap<String, BTreeMap<String, Variable>>,
 	pub num: Type,
 }
 
-impl JIT {
-	pub fn get_module(&mut self) -> &JITModule {
+impl Compiler {
+	pub fn get_module(&mut self) -> &CompilerModule {
 		&self.module
 	}
 
-	pub fn new() -> Result<Self, TrippyError> {
-		let builder =
-			JITBuilder::new(cranelift_module::default_libcall_names())
-				.map_err(TrippyError::JitInitialization)?;
-		let module = JITModule::new(builder);
-		let num = module.target_config().pointer_type();
+	pub fn get_module_deref(self) -> CompilerModule {
+		self.module
+	}
+
+	pub fn new(
+		use_jit: bool,
+		target: Option<String>,
+	) -> Result<Self, TrippyError> {
+		let mut module: CompilerModule = if use_jit {
+			let builder =
+				JITBuilder::new(cranelift_module::default_libcall_names())
+					.map_err(TrippyError::JitInitialization)?;
+			CompilerModule::Jit(JITModule::new(builder))
+		} else {
+			let flag_builder = settings::builder();
+			let isa_builder = cranelift_codegen::isa::lookup_by_name(
+				&target
+					.unwrap_or_else(|| "x86_64-unknown-linux-musl".to_string()),
+			)
+			.unwrap();
+			let isa = isa_builder
+				.finish(settings::Flags::new(flag_builder))
+				.unwrap();
+			let builder = ObjectBuilder::new(
+				isa,
+				"main",
+				cranelift_module::default_libcall_names(),
+			)
+			.map_err(TrippyError::JitInitialization)?;
+			CompilerModule::Object(ObjectModule::new(builder))
+		};
+		let num = module.into_generic().target_config().pointer_type();
 
 		Ok(Self {
 			data_ctx: DataContext::new(),
@@ -64,9 +106,8 @@ impl JIT {
 	}
 }
 
-/// Compile a string in the toy language into machine code.
-pub fn compile(jit: &mut JIT, ast: Vec<Instruction>) -> Result<*const u8> {
-	let mut ctx = jit.module.make_context();
+pub fn prepare(jit: &mut Compiler, ast: Vec<Instruction>) -> Result<FuncId> {
+	let mut ctx = jit.module.into_generic().make_context();
 	let mut builder_context = FunctionBuilderContext::new();
 
 	ctx.func.signature.returns.push(AbiParam::new(jit.num));
@@ -116,75 +157,48 @@ pub fn compile(jit: &mut JIT, ast: Vec<Instruction>) -> Result<*const u8> {
 
 	let id = jit
 		.module
+		.into_generic()
 		.declare_function("main", Linkage::Export, &ctx.func.signature)
 		.map_err(TrippyError::JitInitialization)?;
 
 	jit.module
+		.into_generic()
 		.define_function(id, &mut ctx)
 		.map_err(TrippyError::JitInitialization)?;
 
 	//println!("{}", ctx.func);
-	jit.module.clear_context(&mut ctx);
+	jit.module.into_generic().clear_context(&mut ctx);
 
-	jit.module.finalize_definitions();
-
-	let code = jit.module.get_finalized_function(id);
-
-	Ok(code)
-}
-
-/// Create a zero-initialized data section.
-pub fn create_data(
-	jit: &mut JIT,
-	name: &str,
-	contents: Vec<u8>,
-) -> Result<Vec<u8>, String> {
-	// The steps here are analogous to `compile`, except that data is much
-	// simpler than functions.
-	jit.data_ctx.define(contents.into_boxed_slice());
-	let id = jit
-		.module
-		.declare_data(name, Linkage::Export, true, false)
-		.map_err(|e| e.to_string())?;
-
-	jit.module
-		.define_data(id, &jit.data_ctx)
-		.map_err(|e| e.to_string())?;
-	jit.data_ctx.clear();
-	jit.module.finalize_definitions();
-	let buffer = jit.module.get_finalized_data(id);
-	// TODO: Can we move the unsafe into cranelift?
-	Ok(unsafe { std::slice::from_raw_parts(buffer.0, buffer.1).to_vec() })
+	Ok(id)
 }
 
 fn create_anonymous_string(
-	jit: &mut JIT,
+	jit: &mut Compiler,
 	func_builder: &mut FunctionBuilder,
 	string_content: &str,
 ) -> Value {
+	let module = jit.module.into_generic();
 	jit.data_ctx
 		.define(string_content.as_bytes().to_vec().into_boxed_slice());
 
-	let sym = jit
-		.module
+	let sym = module
 		.declare_anonymous_data(true, false)
 		.expect("problem declaring data object");
 
-	let _result = jit
-		.module
+	let _result = module
 		.define_data(sym, &jit.data_ctx)
 		.map_err(|e| e.to_string());
 
-	let local_id = jit.module.declare_data_in_func(sym, func_builder.func);
+	let local_id = module.declare_data_in_func(sym, func_builder.func);
 	jit.data_ctx.clear();
 
-	let pointer = jit.module.target_config().pointer_type();
+	let pointer = module.target_config().pointer_type();
 	func_builder.ins().symbol_value(pointer, local_id)
 }
 
 /// When you write out instructions in Cranelift, you get back `Value`s. You
 pub fn translate_expr(
-	jit: &mut JIT,
+	jit: &mut Compiler,
 	func_builder: &mut FunctionBuilder,
 	expr: Instruction,
 ) -> Value {
@@ -246,7 +260,7 @@ pub fn translate_expr(
 }
 
 pub fn translate_assign(
-	jit: &mut JIT,
+	jit: &mut Compiler,
 	func_builder: &mut FunctionBuilder,
 	name: String,
 	expr: Instruction,
@@ -261,7 +275,7 @@ pub fn translate_assign(
 }
 
 pub fn translate_icmp(
-	jit: &mut JIT,
+	jit: &mut Compiler,
 	func_builder: &mut FunctionBuilder,
 	cmp: IntCC,
 	lhs: Instruction,
@@ -274,7 +288,7 @@ pub fn translate_icmp(
 }
 
 pub fn translate_if_else(
-	jit: &mut JIT,
+	jit: &mut Compiler,
 	func_builder: &mut FunctionBuilder,
 	condition: Instruction,
 	then_body: Vec<Instruction>,
@@ -332,7 +346,7 @@ pub fn translate_if_else(
 }
 
 pub fn translate_while_loop(
-	jit: &mut JIT,
+	jit: &mut Compiler,
 	func_builder: &mut FunctionBuilder,
 	condition: Instruction,
 	loop_body: Vec<Instruction>,
@@ -368,13 +382,14 @@ pub fn translate_while_loop(
 }
 
 pub fn translate_call(
-	jit: &mut JIT,
+	jit: &mut Compiler,
 	func_builder: &mut FunctionBuilder,
 	name: String,
 	args: Vec<Instruction>,
 	is_extern: bool,
 ) -> Value {
-	let mut sig = jit.module.make_signature();
+	let module = jit.module.into_generic();
+	let mut sig = module.make_signature();
 
 	// Add a parameter for each argument.
 	for _arg in &args {
@@ -385,16 +400,15 @@ pub fn translate_call(
 	sig.returns.push(AbiParam::new(jit.num));
 
 	let callee = if is_extern {
-		jit.module
+		module
 			.declare_function(&name.replace("_ext", ""), Linkage::Import, &sig)
 			.expect("problem declaring function")
 	} else {
-		jit.module
+		module
 			.declare_function(&name, Linkage::Local, &sig)
 			.expect("problem declaring function")
 	};
-	let local_callee =
-		jit.module.declare_func_in_func(callee, func_builder.func);
+	let local_callee = module.declare_func_in_func(callee, func_builder.func);
 
 	let mut arg_values = Vec::new();
 	for arg in args {
@@ -405,17 +419,17 @@ pub fn translate_call(
 }
 
 pub fn translate_global_data_addr(
-	jit: &mut JIT,
+	jit: &mut Compiler,
 	func_builder: &mut FunctionBuilder,
 	name: String,
 ) -> Value {
-	let sym = jit
-		.module
+	let module = jit.module.into_generic();
+	let sym = module
 		.declare_data(&name, Linkage::Export, true, false)
 		.expect("problem declaring data object");
-	let local_id = jit.module.declare_data_in_func(sym, func_builder.func);
+	let local_id = module.declare_data_in_func(sym, func_builder.func);
 
-	let pointer = jit.module.target_config().pointer_type();
+	let pointer = module.target_config().pointer_type();
 	func_builder.ins().symbol_value(pointer, local_id)
 }
 

@@ -14,3 +14,4 @@ cranelift = "0.84.0"
 cranelift-module = "0.84.0"
 cranelift-jit = "0.84.0"
 cranelift-object = "0.84.0"
+cranelift-codegen = { version = "0.84.0", features = ["all-arch"] }
