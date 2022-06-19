@@ -1,17 +1,8 @@
 use ariadne::{Color, Fmt, Label, Report, ReportKind, Source};
 use chumsky::Parser;
-use inkwell::{
-	builder::Builder,
-	context::Context as InkContext,
-	module::{Linkage, Module},
-	targets::{
-		CodeModel, FileType, InitializationConfig, RelocMode, Target,
-		TargetMachine,
-	},
-	types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum},
-	values::{BasicMetadataValueEnum, CallableValue, PointerValue},
-	AddressSpace, OptimizationLevel,
-};
+use cranelift::{codegen::ir::Function, prelude::*};
+use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_module::{DataContext, Linkage, Module, ModuleError};
 use miette::{Diagnostic, Result};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -23,321 +14,484 @@ pub enum TrippyError {
 	#[diagnostic(code(trippy_compiler::io_error))]
 	IoError(#[from] std::io::Error),
 
-	#[error("Module verification failed: {0}")]
-	#[diagnostic(code(trippy_compiler::module_verification))]
-	ModuleVerification(String),
+	#[error("Failed to initialize jit environment: {0}")]
+	#[diagnostic(code(trippy_compiler::jit_initialization))]
+	JitInitialization(#[from] ModuleError),
 
-	#[error("Failed to initialize native target: {0}")]
-	#[diagnostic(code(trippy_compiler::target_initialization))]
-	NativeTargetInitialization(String),
+	#[error("Failed to compile: {0}")]
+	#[diagnostic(code(trippy_compiler::compile))]
+	Compiler(String),
 }
 
-pub fn create_llvm_type<'a>(
-	ctx: &'a InkContext,
-	type_name: &str,
-) -> BasicTypeEnum<'a> {
-	let i32_type = ctx.i32_type();
-	let bool_type = ctx.bool_type();
-	let f64_type = ctx.f64_type();
-	let i8_type = ctx.i8_type();
-	let str_type = ctx.i8_type().ptr_type(AddressSpace::Generic);
+pub fn initialize<'a>(
+	func: &'a mut Function,
+	builder_context: &'a mut FunctionBuilderContext,
+) -> FunctionBuilder<'a> {
+	FunctionBuilder::new(func, builder_context)
+}
 
-	match type_name {
-		"i8" => i8_type.into(),
-		"i32" => i32_type.into(),
-		"f64" => f64_type.into(),
-		"string" => str_type.into(),
-		"boolean" => bool_type.into(),
-		_ => unimplemented!(),
+pub struct JIT {
+	/// The data context, which is to data objects what `ctx` is to functions.
+	pub data_ctx: DataContext,
+
+	/// The module, with the jit backend, which manages the JIT'd
+	/// functions.
+	pub module: JITModule,
+	pub variables: BTreeMap<String, Variable>,
+	pub num: Type,
+}
+
+impl JIT {
+	pub fn get_module(&mut self) -> &JITModule {
+		&self.module
+	}
+
+	pub fn new() -> Result<Self, TrippyError> {
+		let builder =
+			JITBuilder::new(cranelift_module::default_libcall_names())
+				.map_err(TrippyError::JitInitialization)?;
+		let module = JITModule::new(builder);
+		let num = module.target_config().pointer_type();
+
+		Ok(Self {
+			data_ctx: DataContext::new(),
+			module,
+			variables: BTreeMap::new(),
+			num,
+		})
 	}
 }
 
-pub fn create_llvm_arg_types(
-	ctx: &'_ InkContext,
-	args: impl Iterator<Item = Instruction>,
-) -> Vec<BasicMetadataTypeEnum<'_>> {
-	args.map(|arg| match arg {
-		Instruction::StringLiteral(type_name) => {
-			create_llvm_type(ctx, &type_name).into()
-		}
-		_ => unimplemented!(),
-	})
-	.collect()
+/// Compile a string in the toy language into machine code.
+pub fn compile(jit: &mut JIT, ast: Vec<Instruction>) -> Result<*const u8> {
+	let mut ctx = jit.module.make_context();
+	let mut builder_context = FunctionBuilderContext::new();
+
+	ctx.func.signature.returns.push(AbiParam::new(jit.num));
+
+	let mut func_builder =
+		FunctionBuilder::new(&mut ctx.func, &mut builder_context);
+
+	let string = jit.module.target_config().pointer_type();
+
+	//for _p in &params {
+	//jit.ctx.func.signature.params.push(AbiParam::new(jit.num));
+	//}
+
+	// Create the entry block, to start emitting code in.
+	let entry_block = func_builder.create_block();
+
+	// Since this is the entry block, add block parameters corresponding to
+	// the function's parameters.
+	func_builder.append_block_params_for_function_params(entry_block);
+
+	// Tell the builder to emit code in this block.
+	func_builder.switch_to_block(entry_block);
+
+	// And, tell the builder that this block will have no further
+	// predecessors. Since it's the entry block, it won't have any
+	// predecessors.
+	func_builder.seal_block(entry_block);
+
+	// The toy language allows variables to be declared implicitly.
+	// Walk the AST and declare all implicitly-declared variables.
+	// Now translate the statements of the function body.
+	for expr in ast {
+		translate_expr(jit, &mut func_builder, expr);
+	}
+
+	// Set up the return variable of the function. Above, we declared a
+	// variable to hold the return value. Here, we just do a use of that
+	// variable.
+	//let return_variable = jit.variables.get_mut("main").unwrap();
+	//let return_value = func_builder.use_var(*return_variable);
+
+	let ret = func_builder.ins().iconst(cranelift::prelude::types::I64, 0);
+
+	// Emit the return instruction.
+	func_builder.ins().return_(&[ret]);
+
+	// Tell the builder we're done with this function.
+	func_builder.finalize();
+
+	let id = jit
+		.module
+		.declare_function("main", Linkage::Export, &ctx.func.signature)
+		.map_err(TrippyError::JitInitialization)?;
+
+	jit.module
+		.define_function(id, &mut ctx)
+		.map_err(TrippyError::JitInitialization)?;
+
+	println!("{}", ctx.func);
+	jit.module.clear_context(&mut ctx);
+
+	jit.module.finalize_definitions();
+
+	let code = jit.module.get_finalized_function(id);
+
+	Ok(code)
 }
 
-pub fn create_llvm_args<'a>(
-	builder: &Builder<'a>,
-	variables: &BTreeMap<String, PointerValue<'a>>,
+/// Create a zero-initialized data section.
+pub fn create_data(
+	jit: &mut JIT,
+	name: &str,
+	contents: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+	// The steps here are analogous to `compile`, except that data is much
+	// simpler than functions.
+	jit.data_ctx.define(contents.into_boxed_slice());
+	let id = jit
+		.module
+		.declare_data(name, Linkage::Export, true, false)
+		.map_err(|e| e.to_string())?;
+
+	jit.module
+		.define_data(id, &jit.data_ctx)
+		.map_err(|e| e.to_string())?;
+	jit.data_ctx.clear();
+	jit.module.finalize_definitions();
+	let buffer = jit.module.get_finalized_data(id);
+	// TODO: Can we move the unsafe into cranelift?
+	Ok(unsafe { std::slice::from_raw_parts(buffer.0, buffer.1).to_vec() })
+}
+
+fn create_anonymous_string(
+	jit: &mut JIT,
+	func_builder: &mut FunctionBuilder,
+	string_content: &str,
+) -> Value {
+	jit.data_ctx
+		.define(string_content.as_bytes().to_vec().into_boxed_slice());
+
+	let sym = jit
+		.module
+		.declare_anonymous_data(true, false)
+		.expect("problem declaring data object");
+
+	let _result = jit
+		.module
+		.define_data(sym, &jit.data_ctx)
+		.map_err(|e| e.to_string());
+
+	let local_id = jit.module.declare_data_in_func(sym, func_builder.func);
+	jit.data_ctx.clear();
+
+	let pointer = jit.module.target_config().pointer_type();
+	func_builder.ins().symbol_value(pointer, local_id)
+}
+
+/// When you write out instructions in Cranelift, you get back `Value`s. You
+fn translate_expr(
+	jit: &mut JIT,
+	func_builder: &mut FunctionBuilder,
+	expr: Instruction,
+) -> Value {
+	match expr {
+		Instruction::NumericLiteral(literal) => {
+			func_builder.ins().f64const(literal)
+		}
+		Instruction::StringLiteral(literal) => {
+			let mut string_content_with_terminator = literal;
+			string_content_with_terminator.push('\0');
+			create_anonymous_string(
+				jit,
+				func_builder,
+				&string_content_with_terminator,
+			)
+		}
+		Instruction::FunctionCall { name, args } => {
+			translate_call(jit, func_builder, name, args)
+		}
+		Instruction::VariableReference(name) => {
+			// `use_var` is used to read the value of a variable.
+			let variable =
+				jit.variables.get(&name).expect("variable not defined");
+			func_builder.use_var(*variable)
+		}
+		Instruction::Array(value) => panic!("not implemented: {:#?}", value),
+		Instruction::Object(value) => panic!("objects not impelemented"),
+		Instruction::Variable { scope, name, value } => {
+			//panic!("not implemented: variable; {}", name);
+			let var = declare_variable(
+				jit.num,
+				func_builder,
+				&mut jit.variables,
+				&mut 0,
+				&name,
+			);
+			let val = translate_expr(jit, func_builder, *value);
+			func_builder.def_var(var, val);
+			func_builder.use_var(var)
+		}
+	}
+}
+
+fn translate_assign(
+	jit: &mut JIT,
+	func_builder: &mut FunctionBuilder,
+	name: String,
+	expr: Instruction,
+) -> Value {
+	// `def_var` is used to write the value of a variable. Note that
+	// variables can have multiple definitions. Cranelift will
+	// convert them into SSA form for itjit automatically.
+	let new_value = translate_expr(jit, func_builder, expr);
+	let variable = jit.variables.get(&name).unwrap();
+	func_builder.def_var(*variable, new_value);
+	new_value
+}
+
+fn translate_icmp(
+	jit: &mut JIT,
+	func_builder: &mut FunctionBuilder,
+	cmp: IntCC,
+	lhs: Instruction,
+	rhs: Instruction,
+) -> Value {
+	let lhs = translate_expr(jit, func_builder, lhs);
+	let rhs = translate_expr(jit, func_builder, rhs);
+	let c = func_builder.ins().icmp(cmp, lhs, rhs);
+	func_builder.ins().bint(jit.num, c)
+}
+
+fn translate_if_else(
+	jit: &mut JIT,
+	func_builder: &mut FunctionBuilder,
+	condition: Instruction,
+	then_body: Vec<Instruction>,
+	else_body: Vec<Instruction>,
+) -> Value {
+	let condition_value = translate_expr(jit, func_builder, condition);
+
+	let then_block = func_builder.create_block();
+	let else_block = func_builder.create_block();
+	let merge_block = func_builder.create_block();
+
+	// If-else constructs in the toy language have a return value.
+	// In traditional SSA form, this would produce a PHI between
+	// the then and else bodies. Cranelift uses block parameters,
+	// so set up a parameter in the merge block, and we'll pass
+	// the return values to it from the branches.
+	func_builder.append_block_param(merge_block, jit.num);
+
+	// Test the if condition and conditionally branch.
+	func_builder.ins().brz(condition_value, else_block, &[]);
+	// Fall through to then block.
+	func_builder.ins().jump(then_block, &[]);
+
+	func_builder.switch_to_block(then_block);
+	func_builder.seal_block(then_block);
+	let mut then_return = func_builder.ins().iconst(jit.num, 0);
+	for expr in then_body {
+		then_return = translate_expr(jit, func_builder, expr);
+	}
+
+	// Jump to the merge block, passing it the block return value.
+	func_builder.ins().jump(merge_block, &[then_return]);
+
+	func_builder.switch_to_block(else_block);
+	func_builder.seal_block(else_block);
+	let mut else_return = func_builder.ins().iconst(jit.num, 0);
+	for expr in else_body {
+		else_return = translate_expr(jit, func_builder, expr);
+	}
+
+	// Jump to the merge block, passing it the block return value.
+	func_builder.ins().jump(merge_block, &[else_return]);
+
+	// Switch to the merge block for subsequent statements.
+	func_builder.switch_to_block(merge_block);
+
+	// We've now seen all the predecessors of the merge block.
+	func_builder.seal_block(merge_block);
+
+	// Read the value of the if-else by reading the merge block
+	// parameter.
+	let phi = func_builder.block_params(merge_block)[0];
+
+	phi
+}
+
+fn translate_while_loop(
+	jit: &mut JIT,
+	func_builder: &mut FunctionBuilder,
+	condition: Instruction,
+	loop_body: Vec<Instruction>,
+) -> Value {
+	let header_block = func_builder.create_block();
+	let body_block = func_builder.create_block();
+	let exit_block = func_builder.create_block();
+
+	func_builder.ins().jump(header_block, &[]);
+	func_builder.switch_to_block(header_block);
+
+	let condition_value = translate_expr(jit, func_builder, condition);
+	func_builder.ins().brz(condition_value, exit_block, &[]);
+	func_builder.ins().jump(body_block, &[]);
+
+	func_builder.switch_to_block(body_block);
+	func_builder.seal_block(body_block);
+
+	for expr in loop_body {
+		translate_expr(jit, func_builder, expr);
+	}
+	func_builder.ins().jump(header_block, &[]);
+
+	func_builder.switch_to_block(exit_block);
+
+	// We've reached the bottom of the loop, so there will be no
+	// more backedges to the header to exits to the bottom.
+	func_builder.seal_block(header_block);
+	func_builder.seal_block(exit_block);
+
+	// Just return 0 for now.
+	func_builder.ins().iconst(jit.num, 0)
+}
+
+fn translate_call(
+	jit: &mut JIT,
+	func_builder: &mut FunctionBuilder,
+	name: String,
 	args: Vec<Instruction>,
-) -> Vec<BasicMetadataValueEnum<'a>> {
-	let mut llvm_args = vec![];
+) -> Value {
+	let mut sig = jit.module.make_signature();
 
+	// Add a parameter for each argument.
+	for _arg in &args {
+		sig.params.push(AbiParam::new(jit.num));
+	}
+
+	// For simplicity for now, just make all calls return a single I64.
+	sig.returns.push(AbiParam::new(jit.num));
+
+	// TODO: Streamline the API here?
+	let callee = jit
+		.module
+		.declare_function(&name, Linkage::Import, &sig)
+		.expect("problem declaring function");
+	let local_callee =
+		jit.module.declare_func_in_func(callee, func_builder.func);
+
+	let mut arg_values = Vec::new();
 	for arg in args {
-		match arg {
-			Instruction::StringLiteral(value) => {
-				llvm_args.push(BasicMetadataValueEnum::PointerValue(
-					builder
-						.build_global_string_ptr(value.as_str(), "temp")
-						.as_pointer_value(),
-				));
-			}
-			Instruction::VariableReference(name) => {
-				let variable = variables.get(&name);
-
-				if variable.is_none() {
-					panic!("Unknown variable {}", name);
-				}
-
-				let var_arg = builder.build_load(*variable.unwrap(), &name);
-
-				if var_arg.is_pointer_value() {
-					llvm_args.push(BasicMetadataValueEnum::PointerValue(
-						var_arg.into_pointer_value(),
-					));
-				} else if var_arg.is_float_value() {
-					llvm_args.push(BasicMetadataValueEnum::FloatValue(
-						var_arg.into_float_value(),
-					));
-				} else if var_arg.is_int_value() {
-					llvm_args.push(BasicMetadataValueEnum::IntValue(
-						var_arg.into_int_value(),
-					));
-				} else {
-				}
-			}
-			_ => unimplemented!(),
-		}
+		arg_values.push(translate_expr(jit, func_builder, arg))
 	}
-
-	llvm_args
+	let call = func_builder.ins().call(local_callee, &arg_values);
+	func_builder.inst_results(call)[0]
 }
 
-pub fn build<'a>(
-	ctx: &'a InkContext,
-	ast: Vec<Instruction>,
-	module_name: &str,
-) -> Result<Module<'a>> {
-	let module = ctx.create_module(module_name);
+fn translate_global_data_addr(
+	jit: &mut JIT,
+	func_builder: &mut FunctionBuilder,
+	name: String,
+) -> Value {
+	let sym = jit
+		.module
+		.declare_data(&name, Linkage::Export, true, false)
+		.expect("problem declaring data object");
+	let local_id = jit.module.declare_data_in_func(sym, &mut func_builder.func);
 
-	let builder = ctx.create_builder();
+	let pointer = jit.module.target_config().pointer_type();
+	func_builder.ins().symbol_value(pointer, local_id)
+}
 
-	let i32_type = ctx.i32_type();
-	let f64_type = ctx.f64_type();
-	let str_type = ctx.i8_type().ptr_type(AddressSpace::Generic);
-
-	let main_fn_type = i32_type.fn_type(&[], false);
-	let main_fn = module.add_function("main", main_fn_type, None);
-	let entry_basic_block = ctx.append_basic_block(main_fn, "entry");
-
-	builder.position_at_end(entry_basic_block);
-
+fn declare_variables(
+	int: types::Type,
+	func_builder: &mut FunctionBuilder,
+	params: &[String],
+	the_return: &str,
+	stmts: &[Instruction],
+	entry_block: Block,
+) -> BTreeMap<String, Variable> {
 	let mut variables = BTreeMap::new();
+	let mut index = 0;
 
-	for instruction in ast {
-		match instruction {
-			Instruction::Variable {
-				scope: _scope,
-				name,
-				value,
-			} => {
-				let value = *value;
-				let variable_type = match value.clone() {
-					Instruction::StringLiteral(_) => {
-						BasicTypeEnum::PointerType(str_type)
-					}
-					Instruction::NumericLiteral(_) => {
-						BasicTypeEnum::FloatType(f64_type)
-					}
-					Instruction::FunctionCall { name, args } => {
-						match name.as_str() {
-							"loadExternalFunction" => match &args[1] {
-								Instruction::StringLiteral(return_type) => {
-									match &args[0] {
-										Instruction::StringLiteral(_) => {
-											let return_type = create_llvm_type(
-												ctx,
-												return_type,
-											);
-											let fun_type = return_type.fn_type(
-												create_llvm_arg_types(
-													ctx,
-													args.clone()
-														.into_iter()
-														.skip(2),
-												)
-												.as_slice(),
-												true,
-											);
+	for (i, name) in params.iter().enumerate() {
+		// TODO: cranelift_frontend should really have an API to make it easy to set
+		// up param variables.
+		let val = func_builder.block_params(entry_block)[i];
+		let var = declare_variable(
+			int,
+			func_builder,
+			&mut variables,
+			&mut index,
+			name,
+		);
+		func_builder.def_var(var, val);
+	}
+	let zero = func_builder.ins().iconst(int, 0);
+	let return_variable = declare_variable(
+		int,
+		func_builder,
+		&mut variables,
+		&mut index,
+		the_return,
+	);
+	func_builder.def_var(return_variable, zero);
+	for expr in stmts {
+		declare_variables_in_stmt(
+			int,
+			func_builder,
+			&mut variables,
+			&mut index,
+			expr,
+		);
+	}
 
-											BasicTypeEnum::PointerType(
-												fun_type.ptr_type(
-													AddressSpace::Generic,
-												),
-											)
-										}
-										_ => unimplemented!(),
-									}
-								}
-								_ => unimplemented!(),
-							},
-							_ => unimplemented!(),
-						}
-					}
-					_ => unimplemented!(),
-				};
+	variables
+}
 
-				let mut alloca = {
-					match entry_basic_block.get_first_instruction() {
-						Some(first_instr) => {
-							builder.position_before(&first_instr)
-						}
-						None => builder.position_at_end(entry_basic_block),
-					}
-
-					builder.build_alloca(variable_type, &name)
-				};
-
-				match value {
-					Instruction::StringLiteral(value) => {
-						builder.build_store(
-							alloca,
-							ctx.const_string(value.as_bytes(), true),
-						);
-					}
-					Instruction::NumericLiteral(value) => {
-						builder
-							.build_store(alloca, f64_type.const_float(value));
-					}
-					Instruction::FunctionCall { name, args } => {
-						match name.as_str() {
-							"loadExternalFunction" => match &args[0] {
-								Instruction::StringLiteral(fun_name) => {
-									match &args[1] {
-										Instruction::StringLiteral(
-											return_type,
-										) => {
-											let return_type = create_llvm_type(
-												ctx,
-												return_type,
-											);
-											let fun_type = return_type.fn_type(
-												create_llvm_arg_types(
-													ctx,
-													args.clone()
-														.into_iter()
-														.skip(2),
-												)
-												.as_slice(),
-												true,
-											);
-
-											let fun = module.add_function(
-												fun_name,
-												fun_type,
-												Some(Linkage::External),
-											);
-
-											let fun_ptr = fun
-												.as_global_value()
-												.as_pointer_value();
-
-											alloca = builder.build_alloca(
-												fun_ptr.get_type(),
-												&format!("alloca_{}", fun_name),
-											);
-											builder
-												.build_store(alloca, fun_ptr);
-										}
-										_ => unimplemented!(),
-									}
-								}
-								_ => unimplemented!(),
-							},
-							_ => unimplemented!(),
-						}
-					}
-					_ => unimplemented!(),
-				}
-
-				variables.insert(name, alloca);
-			}
-			Instruction::FunctionCall { name, args } => {
-				let variable = variables.get(&name);
-
-				if let Some(variable) = variable {
-					let function = builder.build_load(*variable, "load");
-					let function = function.into_pointer_value();
-					let args = create_llvm_args(&builder, &variables, args);
-
-					builder.build_call(
-						CallableValue::try_from(function).unwrap(),
-						&args,
-						&name,
-					);
-				} else {
-					panic!("Invalid function {}", name);
-				}
-			}
-			_ => unimplemented!(),
+/// Recursively descend through the AST, translating all implicit
+/// variable declarations.
+fn declare_variables_in_stmt(
+	int: types::Type,
+	builder: &mut FunctionBuilder,
+	variables: &mut BTreeMap<String, Variable>,
+	index: &mut usize,
+	expr: &Instruction,
+) {
+	match expr {
+		Instruction::Variable {
+			ref name,
+			value,
+			scope,
+		} => {
+			declare_variable(int, builder, variables, index, name);
 		}
+		//Instruction::IfElse(ref _condition, ref then_body, ref else_body) => {
+		//for stmt in then_body {
+		//declare_variables_in_stmt(int, builder, variables, index, stmt);
+		//}
+		//for stmt in else_body {
+		//declare_variables_in_stmt(int, builder, variables, index, stmt);
+		//}
+		//}
+		//Instruction::WhileLoop(ref _condition, ref loop_body) => {
+		//for stmt in loop_body {
+		//declare_variables_in_stmt(int, builder, variables, index, stmt);
+		//}
+		//}
+		_ => (),
 	}
-
-	builder.build_return(Some(&i32_type.const_zero()));
-
-	//println!(
-	//"Generated LLVM IR: {}",
-	//main_fn.print_to_string().to_string()
-	//);
-
-	module
-		.verify()
-		.map_err(|s| TrippyError::ModuleVerification(s.to_string()))?;
-
-	Ok(module)
 }
 
-pub fn compile(module: &'_ Module) -> Result<Vec<u8>> {
-	Target::initialize_native(&InitializationConfig::default())
-		.map_err(TrippyError::NativeTargetInitialization)?;
-
-	let triple = TargetMachine::get_default_triple();
-	let cpu = TargetMachine::get_host_cpu_name().to_string();
-	let features = TargetMachine::get_host_cpu_features().to_string();
-
-	let target = Target::from_triple(&triple).unwrap();
-	let machine = target
-		.create_target_machine(
-			&triple,
-			&cpu,
-			&features,
-			OptimizationLevel::Aggressive,
-			RelocMode::Default,
-			CodeModel::Default,
-		)
-		.unwrap();
-
-	// create a module and do JIT stuff
-
-	let buffer = machine
-		.write_to_memory_buffer(module, FileType::Object)
-		.unwrap();
-
-	Ok(buffer.as_slice().to_vec())
-}
-
-pub fn interpret(module: &'_ Module) -> Result<i32> {
-	use inkwell::execution_engine::JitFunction;
-
-	let execution_engine = module
-		.create_jit_execution_engine(OptimizationLevel::Default)
-		.unwrap();
-
-	unsafe {
-		let jit_function: JitFunction<unsafe extern "C" fn() -> i32> =
-			execution_engine.get_function("main").unwrap();
-
-		Ok(jit_function.call())
+/// Declare a single variable declaration.
+fn declare_variable(
+	int: types::Type,
+	func_builder: &mut FunctionBuilder,
+	variables: &mut BTreeMap<String, Variable>,
+	index: &mut usize,
+	name: &str,
+) -> Variable {
+	let var = Variable::new(*index);
+	if !variables.contains_key(name) {
+		variables.insert(name.into(), var);
+		func_builder.declare_var(var, int);
+		*index += 1;
 	}
+	var
 }
 
 pub fn parse(src: &str) -> Vec<Instruction> {

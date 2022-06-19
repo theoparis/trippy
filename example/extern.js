@@ -1,2 +1,2 @@
-let printf = loadExternalFunction("printf", "i32");
-printf("hello");
+let x = "hello";
+puts(x);

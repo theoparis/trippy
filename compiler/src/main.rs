@@ -1,9 +1,6 @@
 use bpaf::{construct, positional, short, Info};
 use miette::Result;
-use std::path::Path;
-use trippy_compiler_core::compile;
-use trippy_compiler_core::interpret;
-use trippy_compiler_core::{build, parse, TrippyError};
+use trippy_compiler_core::{compile, parse, TrippyError, JIT};
 
 #[derive(Clone, Debug)]
 struct Opts {
@@ -32,31 +29,33 @@ fn opts() -> Opts {
 fn main() -> Result<()> {
 	let opts = opts();
 
-	let src_name = Path::new(&opts.path).file_name().unwrap().to_str().unwrap();
 	let src =
 		std::fs::read_to_string(&opts.path).map_err(TrippyError::IoError)?;
 
 	let ast = parse(&src);
 
-	let ctx = inkwell::context::Context::create();
-	let module = build(&ctx, ast, src_name)?;
+	let mut jit = JIT::new()?;
+	let func = compile(&mut jit, ast)?;
 
-	if let Some(output_file) = opts.output {
-		let obj = compile(&module)?;
-		let obj_name = src_name.replace(".js", "").replace(".ts", "");
-		let obj_path = format!("{}.o", obj_name);
+	if let Some(_output_file) = opts.output {
+		panic!("Compiling to an object file is not supported yet");
+	//let obj_name = src_name.replace(".js", "").replace(".ts", "");
+	//let obj_path = format!("{}.o", obj_name);
 
-		std::fs::write(obj_path.clone(), obj).map_err(TrippyError::IoError)?;
+	//std::fs::write(obj_path.clone(), obj).map_err(TrippyError::IoError)?;
 
-		std::process::Command::new("clang")
-			.arg("-static")
-			.arg("-o")
-			.arg(output_file)
-			.arg(obj_path)
-			.status()
-			.map_err(TrippyError::IoError)?;
+	//std::process::Command::new("clang")
+	//.arg("-static")
+	//.arg("-o")
+	//.arg(output_file)
+	//.arg(obj_path)
+	//.status()
+	//.map_err(TrippyError::IoError)?;
 	} else {
-		interpret(&module)?;
+		unsafe {
+			let func = std::mem::transmute::<_, fn() -> i64>(func);
+			func();
+		}
 	}
 
 	Ok(())

@@ -8,4 +8,4 @@ license = "MIT"
 trippy-compiler-core = { path = "../compiler-core" }
 miette = { version = "4.7.1", features = ["fancy"] }
 bpaf = "0.4.4"
-inkwell = { git = "https://github.com/TheDan64/inkwell", branch = "master", features = ["llvm13-0"] }
+cranelift = "0.84.0"
