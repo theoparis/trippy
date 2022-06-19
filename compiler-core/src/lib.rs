@@ -38,6 +38,7 @@ pub struct JIT {
 	/// functions.
 	pub module: JITModule,
 	pub variables: BTreeMap<String, Variable>,
+	pub objects: BTreeMap<String, BTreeMap<String, Variable>>,
 	pub num: Type,
 }
 
@@ -57,6 +58,7 @@ impl JIT {
 			data_ctx: DataContext::new(),
 			module,
 			variables: BTreeMap::new(),
+			objects: BTreeMap::new(),
 			num,
 		})
 	}
@@ -71,8 +73,6 @@ pub fn compile(jit: &mut JIT, ast: Vec<Instruction>) -> Result<*const u8> {
 
 	let mut func_builder =
 		FunctionBuilder::new(&mut ctx.func, &mut builder_context);
-
-	let string = jit.module.target_config().pointer_type();
 
 	//for _p in &params {
 	//jit.ctx.func.signature.params.push(AbiParam::new(jit.num));
@@ -123,7 +123,7 @@ pub fn compile(jit: &mut JIT, ast: Vec<Instruction>) -> Result<*const u8> {
 		.define_function(id, &mut ctx)
 		.map_err(TrippyError::JitInitialization)?;
 
-	println!("{}", ctx.func);
+	//println!("{}", ctx.func);
 	jit.module.clear_context(&mut ctx);
 
 	jit.module.finalize_definitions();
@@ -183,14 +183,20 @@ fn create_anonymous_string(
 }
 
 /// When you write out instructions in Cranelift, you get back `Value`s. You
-fn translate_expr(
+pub fn translate_expr(
 	jit: &mut JIT,
 	func_builder: &mut FunctionBuilder,
 	expr: Instruction,
 ) -> Value {
 	match expr {
 		Instruction::NumericLiteral(literal) => {
-			func_builder.ins().f64const(literal)
+			if literal.trunc() == literal {
+				func_builder
+					.ins()
+					.iconst(cranelift::prelude::types::I64, literal as i64)
+			} else {
+				func_builder.ins().f64const(literal)
+			}
 		}
 		Instruction::StringLiteral(literal) => {
 			let mut string_content_with_terminator = literal;
@@ -201,8 +207,12 @@ fn translate_expr(
 				&string_content_with_terminator,
 			)
 		}
+		Instruction::BooleanLiteral(b) => {
+			func_builder.ins().iconst(jit.num, i64::from(b))
+		}
 		Instruction::FunctionCall { name, args } => {
-			translate_call(jit, func_builder, name, args)
+			let is_extern = name.contains("_ext");
+			translate_call(jit, func_builder, name, args, is_extern)
 		}
 		Instruction::VariableReference(name) => {
 			// `use_var` is used to read the value of a variable.
@@ -211,8 +221,12 @@ fn translate_expr(
 			func_builder.use_var(*variable)
 		}
 		Instruction::Array(value) => panic!("not implemented: {:#?}", value),
-		Instruction::Object(value) => panic!("objects not impelemented"),
-		Instruction::Variable { scope, name, value } => {
+		Instruction::Object(value) => panic!("not implemented: {:#?}", value),
+		Instruction::Variable {
+			scope: _,
+			name,
+			value,
+		} => {
 			//panic!("not implemented: variable; {}", name);
 			let var = declare_variable(
 				jit.num,
@@ -225,10 +239,13 @@ fn translate_expr(
 			func_builder.def_var(var, val);
 			func_builder.use_var(var)
 		}
+		Instruction::WhileBlock { condition, body } => {
+			translate_while_loop(jit, func_builder, *condition, body)
+		}
 	}
 }
 
-fn translate_assign(
+pub fn translate_assign(
 	jit: &mut JIT,
 	func_builder: &mut FunctionBuilder,
 	name: String,
@@ -243,7 +260,7 @@ fn translate_assign(
 	new_value
 }
 
-fn translate_icmp(
+pub fn translate_icmp(
 	jit: &mut JIT,
 	func_builder: &mut FunctionBuilder,
 	cmp: IntCC,
@@ -256,7 +273,7 @@ fn translate_icmp(
 	func_builder.ins().bint(jit.num, c)
 }
 
-fn translate_if_else(
+pub fn translate_if_else(
 	jit: &mut JIT,
 	func_builder: &mut FunctionBuilder,
 	condition: Instruction,
@@ -314,7 +331,7 @@ fn translate_if_else(
 	phi
 }
 
-fn translate_while_loop(
+pub fn translate_while_loop(
 	jit: &mut JIT,
 	func_builder: &mut FunctionBuilder,
 	condition: Instruction,
@@ -350,11 +367,12 @@ fn translate_while_loop(
 	func_builder.ins().iconst(jit.num, 0)
 }
 
-fn translate_call(
+pub fn translate_call(
 	jit: &mut JIT,
 	func_builder: &mut FunctionBuilder,
 	name: String,
 	args: Vec<Instruction>,
+	is_extern: bool,
 ) -> Value {
 	let mut sig = jit.module.make_signature();
 
@@ -366,11 +384,15 @@ fn translate_call(
 	// For simplicity for now, just make all calls return a single I64.
 	sig.returns.push(AbiParam::new(jit.num));
 
-	// TODO: Streamline the API here?
-	let callee = jit
-		.module
-		.declare_function(&name, Linkage::Import, &sig)
-		.expect("problem declaring function");
+	let callee = if is_extern {
+		jit.module
+			.declare_function(&name.replace("_ext", ""), Linkage::Import, &sig)
+			.expect("problem declaring function")
+	} else {
+		jit.module
+			.declare_function(&name, Linkage::Local, &sig)
+			.expect("problem declaring function")
+	};
 	let local_callee =
 		jit.module.declare_func_in_func(callee, func_builder.func);
 
@@ -382,7 +404,7 @@ fn translate_call(
 	func_builder.inst_results(call)[0]
 }
 
-fn translate_global_data_addr(
+pub fn translate_global_data_addr(
 	jit: &mut JIT,
 	func_builder: &mut FunctionBuilder,
 	name: String,
@@ -391,13 +413,13 @@ fn translate_global_data_addr(
 		.module
 		.declare_data(&name, Linkage::Export, true, false)
 		.expect("problem declaring data object");
-	let local_id = jit.module.declare_data_in_func(sym, &mut func_builder.func);
+	let local_id = jit.module.declare_data_in_func(sym, func_builder.func);
 
 	let pointer = jit.module.target_config().pointer_type();
 	func_builder.ins().symbol_value(pointer, local_id)
 }
 
-fn declare_variables(
+pub fn declare_variables(
 	int: types::Type,
 	func_builder: &mut FunctionBuilder,
 	params: &[String],
@@ -452,29 +474,27 @@ fn declare_variables_in_stmt(
 	index: &mut usize,
 	expr: &Instruction,
 ) {
-	match expr {
-		Instruction::Variable {
-			ref name,
-			value,
-			scope,
-		} => {
-			declare_variable(int, builder, variables, index, name);
-		}
-		//Instruction::IfElse(ref _condition, ref then_body, ref else_body) => {
-		//for stmt in then_body {
-		//declare_variables_in_stmt(int, builder, variables, index, stmt);
-		//}
-		//for stmt in else_body {
-		//declare_variables_in_stmt(int, builder, variables, index, stmt);
-		//}
-		//}
-		//Instruction::WhileLoop(ref _condition, ref loop_body) => {
-		//for stmt in loop_body {
-		//declare_variables_in_stmt(int, builder, variables, index, stmt);
-		//}
-		//}
-		_ => (),
+	if let Instruction::Variable {
+		ref name,
+		value: _,
+		scope: _,
+	} = expr
+	{
+		declare_variable(int, builder, variables, index, name);
 	}
+	//Instruction::IfElse(ref _condition, ref then_body, ref else_body) => {
+	//for stmt in then_body {
+	//declare_variables_in_stmt(int, builder, variables, index, stmt);
+	//}
+	//for stmt in else_body {
+	//declare_variables_in_stmt(int, builder, variables, index, stmt);
+	//}
+	//}
+	//Instruction::WhileLoop(ref _condition, ref loop_body) => {
+	//for stmt in loop_body {
+	//declare_variables_in_stmt(int, builder, variables, index, stmt);
+	//}
+	//}
 }
 
 /// Declare a single variable declaration.

@@ -1,2 +1,4 @@
-let x = "hello";
-puts(x);
+while (true) {
+  puts_ext("hi");
+  sleep_ext(1);
+}

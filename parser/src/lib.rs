@@ -12,6 +12,7 @@ pub enum VariableScope {
 pub enum Instruction {
 	StringLiteral(String),
 	NumericLiteral(f64),
+	BooleanLiteral(bool),
 	FunctionCall {
 		name: String,
 		args: Vec<Instruction>,
@@ -24,6 +25,10 @@ pub enum Instruction {
 		value: Box<Instruction>,
 	},
 	VariableReference(String),
+	WhileBlock {
+		condition: Box<Instruction>,
+		body: Vec<Instruction>,
+	},
 }
 
 impl std::fmt::Display for Instruction {
@@ -33,6 +38,9 @@ impl std::fmt::Display for Instruction {
 				write!(f, "{}", value)?;
 			}
 			Instruction::NumericLiteral(value) => {
+				write!(f, "{}", value)?;
+			}
+			Instruction::BooleanLiteral(value) => {
 				write!(f, "{}", value)?;
 			}
 			Instruction::FunctionCall { name, args } => {
@@ -54,6 +62,7 @@ impl std::fmt::Display for Instruction {
 				unimplemented!()
 			}
 			Instruction::Variable { .. } => unimplemented!(),
+			Instruction::WhileBlock { .. } => unimplemented!(),
 		}
 
 		Ok(())
@@ -109,6 +118,11 @@ pub fn value() -> impl Parser<char, Instruction, Error = Simple<char>> {
 			.collect::<String>()
 			.labelled("numeric_literal")
 			.map(|n| Instruction::NumericLiteral(n.parse().unwrap()));
+
+		let bool_literal = just("true")
+			.or(just("false"))
+			.labelled("boolean_literal")
+			.map(|b| Instruction::BooleanLiteral(b.parse().unwrap()));
 
 		let member = choice((string, text::ident()))
 			.labelled("identifier")
@@ -176,6 +190,7 @@ pub fn value() -> impl Parser<char, Instruction, Error = Simple<char>> {
 		choice((
 			string_literal,
 			num_literal,
+			bool_literal,
 			fn_call,
 			object,
 			variable,
@@ -185,8 +200,29 @@ pub fn value() -> impl Parser<char, Instruction, Error = Simple<char>> {
 }
 
 pub fn parser() -> impl Parser<char, Vec<Instruction>, Error = Simple<char>> {
-	value()
+	let block = value()
 		.then_ignore(just(';').or_not())
+		.padded()
+		.repeated()
+		.padded()
+		.or_not()
+		.delimited_by(just('{'), just('}'))
+		.labelled("block");
+
+	let while_block = just("while")
+		.padded()
+		.ignore_then(value().padded().delimited_by(just('('), just(')')))
+		.padded()
+		.then(block)
+		.padded()
+		.labelled("while_block")
+		.map(|cond| Instruction::WhileBlock {
+			condition: Box::new(cond.0),
+			body: cond.1.unwrap_or_default(),
+		});
+
+	while_block
+		//.or(value().then_ignore(just(';').or_not()))
 		.padded()
 		.repeated()
 		.then_ignore(end())
