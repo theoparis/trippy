@@ -1,0 +1,12 @@
+[package]
+name = "trippy"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+chumsky = { git = "https://github.com/zesterer/chumsky" } 
+
+[dev-dependencies]
+ariadne = "0.1.5"
+
