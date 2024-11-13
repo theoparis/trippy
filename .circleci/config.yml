@@ -4,7 +4,7 @@ jobs:
     docker:
       - image: instrumentisto/rust:nightly-alpine
     steps:
+      - run: apk -UvX http://dl-cdn.alpinelinux.org/alpine/edge/main add -u musl-dev llvm-dev git
       - checkout
-      - run: apk -UvX http://dl-cdn.alpinelinux.org/alpine/edge/main add -u musl-dev llvm-dev
       - run: cargo fmt --all -- --check
       - run: cargo clippy -- -Dwarnings
